@@ -23,6 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -48,6 +51,15 @@ def simulate(cands: list[Candidate], seq: list[int], n: int) -> np.ndarray:
     b = np.zeros(n, dtype=bool)
     for k in seq:
         b = b | cands[k].mask if cands[k].op == "pad" else b & ~cands[k].mask
+    return b
+
+
+def simulate_points(tools: list[Candidate], pts: np.ndarray) -> np.ndarray:
+    """Analytic membership of arbitrary points in the body built from ``tools`` (in order)."""
+    b = np.zeros(len(pts), dtype=bool)
+    for c in tools:
+        m = c.contains(pts)
+        b = b | m if c.op == "pad" else b & ~m
     return b
 
 
@@ -203,7 +215,7 @@ def blend_candidates(shape, faces, explained: np.ndarray) -> list[dict]:
             continue
         if f.kind in ("cylinder", "torus") and not (f.kind == "cylinder" and f.span and f.span > 2 * math.pi - 1e-3):
             kinds[f.index] = "fillet"
-        elif f.kind == "plane":
+        elif f.kind in ("plane", "cone"):  # a chamfer on a circular edge is a cone face
             kinds[f.index] = "chamfer"
     out = []
     for ve in sharp_edges(shape, kinds) if kinds else []:
@@ -218,8 +230,46 @@ def blend_candidates(shape, faces, explained: np.ndarray) -> list[dict]:
     return out
 
 
-def apply_blends(target, faces, ps: PointSet, body, hist: History, log: list):
-    pred = classify(body, ps.p)
+class CrashJournal:
+    """Remembers kernel calls that killed the process (OCC access violations cannot be caught).
+
+    ``guard(key)`` writes "start key" before a risky call and ``done(key)`` "end key" after it; a
+    key started but never ended in an earlier run crashed, and ``crashed_group(group)`` tells the
+    caller to skip its group. The pipeline is deterministic, so a re-run reaches the same calls."""
+
+    def __init__(self, path: Path | None):
+        self.path, self.bad = path, set()
+        if path and path.exists():
+            started, ended = set(), set()
+            for line in path.read_text(encoding="utf-8").splitlines():
+                tag, _, key = line.partition("\t")
+                (started if tag == "start" else ended).add(key)
+            self.bad = started - ended
+
+    def crashed_group(self, group: str) -> bool:
+        """Any call of this group crashed (keys are "<group>#<detail>")."""
+        return any(k.split("#", 1)[0] == group for k in self.bad)
+
+    def _write(self, tag: str, key: str) -> None:
+        if self.path:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(f"{tag}\t{key}\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+
+    def guard(self, key: str) -> None:
+        self._write("start", key)
+
+    def done(self, key: str) -> None:
+        self._write("end", key)
+
+
+def apply_blends(target, faces, ps: PointSet, body, hist: History, log: list,
+                 journal: CrashJournal | None = None, tag: str = "main", pred: np.ndarray | None = None):
+    """``pred``: membership of ``ps.p`` in ``body`` if already known (analytic), else classified."""
+    journal = journal or CrashJournal(None)
+    if pred is None:
+        pred = classify(body, ps.p)
     acc = face_accuracy(ps, pred, len(faces))
     blends = blend_candidates(target, faces, acc >= EXPLAINED)
     diag = target.BoundingBox().DiagonalLength
@@ -234,6 +284,14 @@ def apply_blends(target, faces, ps: PointSet, body, hist: History, log: list):
         for trial in trials:
             if any(id(it) in done for it in trial):
                 continue
+            # a blend size that crashed the kernel once usually crashes on its other edges too:
+            # skip the whole (type, size) group after a crash
+            jgroup = f"{tag}|{key[0]}|{key[1]:.6g}"
+            jkey = f"{jgroup}#{len(hist.groups)}|" + ";".join(
+                sorted(",".join(f"{v:.4f}" for v in it["point"]) for it in trial))
+            if journal.crashed_group(jgroup):
+                log.append(f"blend {key[0]} {key[1]:.4g} × {len(trial)} skipped: crashed the kernel in an earlier run")
+                continue
             try:
                 edges, seen = [], set()
                 for it in trial:
@@ -241,12 +299,16 @@ def apply_blends(target, faces, ps: PointSet, body, hist: History, log: list):
                     if e.hashCode() not in seen:
                         seen.add(e.hashCode())
                         edges.append(e)
+                journal.guard(jkey)
                 new = body.fillet(key[1], edges) if key[0] == "fillet" else body.chamfer(key[1], None, edges)
                 solids = new.clean().Solids()
-                if len(solids) != 1 or not solids[0].isValid():
+                ok = len(solids) == 1 and solids[0].isValid()
+                journal.done(jkey)
+                if not ok:
                     raise BuildError("blend result is not one valid solid")
                 new = solids[0]
             except Exception as e:  # kernel failures
+                journal.done(jkey)
                 log.append(f"blend {key[0]} {key[1]:.4g} × {len(trial)} failed: {str(e)[:80]}")
                 continue
             # score on the samples near the blended faces only
@@ -280,15 +342,23 @@ def face_accuracy(ps: PointSet, pred: np.ndarray, n_faces: int) -> np.ndarray:
 
 # ----------------------------------------------------------------- mirror --
 
-def symmetry_planes(shape, faces, ps: PointSet, n_check: int = 3000, seed: int = 0) -> list[tuple]:
+def symmetry_planes(shape, faces, ps: PointSet, n_check: int = 3000, batch: int = 250, seed: int = 0) -> list[tuple]:
+    """Mirror planes through the bbox centre (normal = a plane-face direction): reflected sample
+    points must keep their inside / outside label. Checked in batches, stopping at the first batch
+    with a mismatch (most directions fail within the first batch)."""
     c = np.array(shape.BoundingBox().center.toTuple())
     rng = np.random.default_rng(seed)
     idx = rng.choice(len(ps.p), min(n_check, len(ps.p)), replace=False)
     out = []
     for d in directions([f for f in faces if f.kind == "plane"]):
-        p = ps.p[idx]
-        q = p - 2 * np.outer((p - c) @ d, d)
-        if (classify(shape, q) == ps.y[idx]).mean() > 0.999:
+        wrong = 0
+        for k in range(0, len(idx), batch):
+            p = ps.p[idx[k:k + batch]]
+            q = p - 2 * np.outer((p - c) @ d, d)
+            wrong += int((classify(shape, q) != ps.y[idx[k:k + batch]]).sum())
+            if wrong > 1e-3 * len(idx):
+                break
+        else:
             out.append((c, d))
     return out
 
@@ -305,9 +375,10 @@ def half_space(shape, c, d):
 # ------------------------------------------------------------------- main --
 
 def prismatic_history(target, log: list, stats: dict, n_uniform: int, rounds: int = 4):
-    """Steps 1–3 on ``target``: returns (body, History, faces, PointSet). Candidates the kernel
-    rejects (e.g. the point model misses that a cut disconnects the body) are banned and the
-    search re-planned; the plan with the lowest kernel-verified error is kept."""
+    """Steps 1–3 on ``target``: returns (body, History, faces, PointSet, tools). Candidates the
+    kernel rejects (e.g. the point model misses that a cut disconnects the body) are banned and the
+    search re-planned; the plan whose kept tools have the lowest error is used. ``tools`` are the
+    candidates the kernel applied, so their analytic membership describes ``body``."""
     faces = analyse_faces(target)
     ps = make_points(target, faces, n_uniform)
     cands = extrusion_candidates(target, faces, ps, stats) + hole_candidates(target, faces, ps)
@@ -319,24 +390,27 @@ def prismatic_history(target, log: list, stats: dict, n_uniform: int, rounds: in
         chosen = [idx[k] for k in greedy([cands[i] for i in idx], ps)]
         rlog: list[str] = []
         body, hist, skipped = kernel_build([cands[k].features for k in chosen], [cands[k].desc for k in chosen], rlog)
-        err = _error(ps, classify(body, ps.p)) if body is not None else math.inf
+        kept = [k for j, k in enumerate(chosen) if j not in skipped]
+        err = _error(ps, simulate(cands, kept, len(ps.y))) if body is not None else math.inf
         if best is None or err < best[0] - 1e-12:
-            best = (err, body, hist, rlog)
+            best = (err, body, hist, rlog, [cands[k] for k in kept])
         if not skipped:
             break
         banned.update(chosen[k] for k in skipped)
     log += best[3]
-    return best[1], best[2], faces, ps
+    return best[1], best[2], faces, ps, best[4]
 
 
-def reconstruct(target, n_uniform: int = 16384, try_mirror: bool = True) -> dict:
+def reconstruct(target, n_uniform: int = 16384, try_mirror: bool = True, journal: Path | None = None) -> dict:
     t0 = time.time()
     log: list[str] = []
     stats: dict = {}
-    body, hist, faces, ps = prismatic_history(target, log, stats, n_uniform)
+    jr = CrashJournal(journal)
+    body, hist, faces, ps, tools = prismatic_history(target, log, stats, n_uniform)
     results = []
     if body is not None:
-        body, hist, pred = apply_blends(target, faces, ps, body, hist, log)
+        body, hist, pred = apply_blends(target, faces, ps, body, hist, log, jr, "main",
+                                        pred=simulate_points(tools, ps.p))
         results.append({"body": body, "hist": hist, "pred": pred, "mirror": None})
     if try_mirror:
         for c, d in symmetry_planes(target, faces, ps):
@@ -344,7 +418,7 @@ def reconstruct(target, n_uniform: int = 16384, try_mirror: bool = True) -> dict
             if half is None:
                 continue
             mlog: list[str] = []
-            hbody, hhist, _, _ = prismatic_history(half, mlog, stats, n_uniform)
+            hbody, hhist, _, _, htools = prismatic_history(half, mlog, stats, n_uniform)
             if hbody is None:
                 continue
             mirror = {"type": "mirror", "plane": {"origin": tuple(map(float, c)), "normal": tuple(map(float, d))}}
@@ -356,7 +430,10 @@ def reconstruct(target, n_uniform: int = 16384, try_mirror: bool = True) -> dict
                 continue
             hhist.groups.append([mirror])
             hhist.descs.append(f"mirror normal {np.round(d, 3).tolist()}")
-            mbody, mhist, mpred = apply_blends(target, faces, ps, b2[0], hhist, mlog)
+            q = ps.p - 2 * np.outer((ps.p - c) @ d, d)
+            mpred0 = simulate_points(htools, ps.p) | simulate_points(htools, q)
+            mbody, mhist, mpred = apply_blends(target, faces, ps, b2[0], hhist, mlog, jr,
+                                               "mirror" + ",".join(f"{v:.4f}" for v in d), pred=mpred0)
             results.append({"body": mbody, "hist": mhist, "pred": mpred, "mirror": d, "log": mlog})
     if not results:
         raise RuntimeError("no body could be built: " + "; ".join(log[-3:]))
@@ -413,16 +490,35 @@ def load_target(path: Path):
     return solids[0]
 
 
+CRASH_RETRIES = 6  # restarts after a kernel crash; each one skips the blend group that crashed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("step", type=Path)
     ap.add_argument("--out", type=Path, required=True, help="output path prefix")
     ap.add_argument("--uniform", type=int, default=16384, help="uniform sample points")
     ap.add_argument("--no-mirror", action="store_true")
+    ap.add_argument("--journal", type=Path, help=argparse.SUPPRESS)  # set by the supervisor below
     args = ap.parse_args()
 
+    if args.journal is None:
+        # Supervisor: run the reconstruction in a child process and restart it if OpenCASCADE crashes.
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        journal = args.out.parent / f"{args.out.name}_crashes.txt"
+        journal.unlink(missing_ok=True)
+        for attempt in range(CRASH_RETRIES + 1):
+            rc = subprocess.run([sys.executable, "-W", "ignore", "-m", "recon.reconstruct", *sys.argv[1:],
+                                 "--journal", str(journal)]).returncode
+            if rc == 0 or rc in (1, 2):  # success, Python error or usage error: do not retry
+                break
+            print(f"kernel crash (exit code {rc}); retrying without the crashing call "
+                  f"({attempt + 1}/{CRASH_RETRIES})", flush=True)
+        journal.unlink(missing_ok=True)
+        raise SystemExit(rc)
+
     target = load_target(args.step)
-    res = reconstruct(target, args.uniform, not args.no_mirror)
+    res = reconstruct(target, args.uniform, not args.no_mirror, args.journal)
     rep = write_outputs(target, res, args.out)
     for i, d in enumerate(rep["history"], 1):
         print(f"  {i:>2}. {d}")

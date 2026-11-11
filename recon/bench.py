@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -21,6 +22,8 @@ from pathlib import Path
 import numpy as np
 
 from cadseq.workers import SupervisedPool
+
+from .reconstruct import CRASH_RETRIES
 
 
 def run_one(task: dict) -> dict:
@@ -31,7 +34,7 @@ def run_one(task: dict) -> dict:
 
     t0 = time.time()
     target = load_target(Path(task["step"]))
-    res = reconstruct(target, task.get("uniform", 16384), task.get("mirror", True))
+    res = reconstruct(target, task.get("uniform", 16384), task.get("mirror", True), Path(task["journal"]))
     seq = res["history"].sequence()
     try:
         strict = build(seq)
@@ -43,7 +46,7 @@ def run_one(task: dict) -> dict:
         if f.type != "sketch":
             ops[f.type] += 1
     acc = res["face_acc"]
-    out = {**{k: v for k, v in task.items() if k not in ("uniform", "mirror")},
+    out = {**{k: v for k, v in task.items() if k not in ("uniform", "mirror", "journal")},
            "iou": mc_iou(res["body"], target), "strict": strict_ok, "features": res["history"].n_features(),
            "ops": dict(ops), "faces": len(acc), "unexplained": int((acc < EXPLAINED).sum()),
            "unexplained_kinds": sorted({res["faces"][i].kind for i in np.nonzero(acc < EXPLAINED)[0]}),
@@ -98,29 +101,45 @@ def main() -> None:
     for pat in args.steps:
         for p in sorted(glob.glob(pat)) or [pat]:
             tasks.append({"id": Path(p).stem, "family": "real", "step": p})
-    for t in tasks:
-        t["mirror"] = not args.no_mirror
     name = args.name or (args.split if args.data else "real")
     out = Path("runs/recon") / f"bench_{name}.jsonl"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    jdir = out.parent / f"journal_{name}"
+    jdir.mkdir(parents=True, exist_ok=True)
+    for t in tasks:
+        t["mirror"] = not args.no_mirror
+        t["journal"] = str(jdir / f"{t['id']}.txt")
+        Path(t["journal"]).unlink(missing_ok=True)
 
     rows, failed, t0 = [], [], time.time()
     pool = SupervisedPool(run_one, args.workers, args.timeout, tasks_per_worker=20)
+    results = []
+    for k, res in enumerate(pool.run(tasks), 1):
+        results.append(res)
+        if k % 20 == 0 or k == len(tasks):
+            ok = [r for _, s, r in results if s == "ok"]
+            iou = np.array([r["iou"] for r in ok]) if ok else np.zeros(1)
+            print(f"[{k}/{len(tasks)}] {time.time() - t0:.0f}s  IoU mean {iou.mean():.4f} median {np.median(iou):.4f} "
+                  f">0.99 {(iou > 0.99).mean():.3f}  failed {k - len(ok)}", flush=True)
+    # OCC access violations: retry crashed parts in fresh workers; the crash journal of each part
+    # makes the retry skip the kernel call that crashed
+    for round_ in range(1, CRASH_RETRIES + 1):
+        retry = [i for i, status, _ in results if status == "crash"]
+        if not retry:
+            break
+        print(f"retry {round_}: {len(retry)} crashed part(s)", flush=True)
+        again = {retry[j]: (s, r) for j, s, r in pool.run([tasks[i] for i in retry])}
+        results = [(i, *again[i]) if i in again else (i, s, r) for i, s, r in results]
+    pool.close()
+    shutil.rmtree(jdir, ignore_errors=True)
     with open(out, "w", encoding="utf-8") as fh:
-        for k, (i, status, result) in enumerate(pool.run(tasks), 1):
+        for k, (i, status, result) in enumerate(results, 1):
             if status == "ok":
                 rows.append(result)
                 fh.write(json.dumps(result) + "\n")
-                fh.flush()
             else:
                 failed.append({**tasks[i], "status": status, "error": result})
                 fh.write(json.dumps(failed[-1]) + "\n")
-            if k % 20 == 0 or k == len(tasks):
-                ok = summarize(rows, len(failed))
-                print(f"[{k}/{len(tasks)}] {time.time() - t0:.0f}s  IoU mean {ok['iou_mean']} median {ok['iou_median']} "
-                      f">0.99 {ok['iou>0.99']}  strict {ok['strict']}  all faces explained {ok['all_faces_explained']}  "
-                      f"failed {len(failed)}", flush=True)
-    pool.close()
+    print(f"done in {time.time() - t0:.0f}s", flush=True)
 
     summary = {"overall": summarize(rows, len(failed))}
     by_fam = defaultdict(list)

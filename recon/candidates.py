@@ -6,7 +6,9 @@ estimated:
 
 * **pad / pocket** — for each extrusion direction d (normals of planar faces, axes of cylinders and
   cones) the planar faces perpendicular to d define *levels*. Between consecutive levels the target
-  is a prism along d, so its cross-section at the slab middle (an exact OCC section) is a sketch.
+  is a prism along d, so its cross-section (an exact OCC section) is a sketch. Each slab is cut at
+  several heights: a hole or blend crossing the slab spoils only some sections (curves the sketch
+  cannot express, or an outline split by the hole), so every distinct representable outline is kept.
   Pad = section outer loop (optionally with its inner loops) extruded over any span of levels that
   contains the slab; pocket = an inner loop cut over such a span (through-all if it spans the part);
   trim = cut everything *outside* the outer loop over such a span (sketch: a frame with the outline
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Callable
 
 import numpy as np
 
@@ -43,17 +46,21 @@ class PointSet:
 
 
 def make_points(shape, faces: list[FaceInfo], n_uniform: int = 16384, seed: int = 0) -> PointSet:
+    """Uniform points are classified by the kernel; surface samples are labelled by construction
+    (−δ·n inside, +δ·n outside) — they agree with the kernel classifier on 99.97 % of samples
+    (synthetic test parts) and point classification dominates the runtime otherwise."""
     bb = shape.BoundingBox()
     lo, hi = np.array([bb.xmin, bb.ymin, bb.zmin]), np.array([bb.xmax, bb.ymax, bb.zmax])
     pad = 0.01 * (hi - lo) + 1e-3
     delta = float(min(0.05, 1e-3 * bb.DiagonalLength))
     rng = np.random.default_rng(seed)
     uni = lo - pad + (hi - lo + 2 * pad) * rng.random((n_uniform, 3))
-    surf, fid = [], []
+    surf, fid, lab = [], [], []
     for f in faces:
         if len(f.points):
             surf += [f.points - delta * f.normals, f.points + delta * f.normals]
             fid += [f.index] * (2 * len(f.points))
+            lab += [True] * len(f.points) + [False] * len(f.points)
     surf = np.concatenate(surf) if surf else np.zeros((0, 3))
     p = np.concatenate([uni, surf])
     face = np.concatenate([np.full(len(uni), -1), np.array(fid, dtype=int)])
@@ -63,7 +70,8 @@ def make_points(shape, faces: list[FaceInfo], n_uniform: int = 16384, seed: int 
     for i in set(fid):
         sel = face == i
         w[sel] = 1.0 / nf / sel.sum()
-    return PointSet(p, classify(shape, p), w, face, delta)
+    y = np.concatenate([classify(shape, uni), np.array(lab, dtype=bool)])
+    return PointSet(p, y, w, face, delta)
 
 
 @dataclass
@@ -74,6 +82,7 @@ class Candidate:
     desc: str
     prefer: float = 0.0        # tie-break bonus (fewer / more meaningful features)
     meta: dict = field(default_factory=dict)
+    contains: Callable | None = None   # (M, 3) points → (M,) inside the tool (analytic)
 
 
 def _dedupe_dirs(dirs, tol=1e-9):
@@ -115,6 +124,45 @@ def _profile(outer, inner=()) -> dict:
     return {"outer": [c.model_dump() for c in outer], "inner": [[c.model_dump() for c in l] for l in inner]}
 
 
+def _loop_sig(curves) -> tuple:
+    """Geometry signature of a loop, rounded so that sections at different heights compare equal."""
+    out = []
+    for c in curves:
+        vals = [v for k, v in c.model_dump().items() if k != "type"]
+        flat = np.concatenate([np.ravel(v) for v in vals]).astype(float)
+        out.append((c.type, tuple(np.round(flat, 6) + 0.0)))
+    return tuple(out)
+
+
+# Section heights inside a slab (fractions). A hole or blend crossing the slab only spoils the
+# sections it passes through; the others still show the clean prism outline.
+SECTION_FRACTIONS = (0.5, 0.25, 0.75)
+FALLBACK_FRACTIONS = (0.1, 0.9, 0.4, 0.6)
+
+
+def _slab_sections(shape, d, x, y, lo: float, hi: float, stats: dict) -> list[tuple]:
+    """Distinct representable (outer, inner) loops of the sections of the slab [lo, hi] along d."""
+    found, sigs, unsupported = [], set(), 0
+    for fracs in (SECTION_FRACTIONS, FALLBACK_FRACTIONS):
+        for t in fracs:
+            for F in section_faces(shape, d, lo + t * (hi - lo)):
+                try:
+                    outer, inner = face_loops(F, x, y)
+                except Unsupported as e:
+                    unsupported += 1
+                    stats.setdefault("unsupported_reasons", set()).add(str(e)[:60])
+                    continue
+                sig = (_loop_sig(outer), tuple(sorted(_loop_sig(l) for l in inner)))
+                if sig not in sigs:
+                    sigs.add(sig)
+                    found.append((outer, inner))
+        if not unsupported:
+            break
+    if unsupported:
+        stats["unsupported_sections"] = stats.get("unsupported_sections", 0) + unsupported
+    return found
+
+
 def extrusion_candidates(shape, faces, ps: PointSet, stats: dict, max_span: int = 6) -> list[Candidate]:
     out: list[Candidate] = []
     verts = np.array([v.toTuple() for v in shape.Vertices()]) if shape.Vertices() else ps.p
@@ -137,13 +185,7 @@ def extrusion_candidates(shape, faces, ps: PointSet, stats: dict, max_span: int 
         corners = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
         rect = [Line(type="line", start=corners[k], end=corners[(k + 1) % 4]) for k in range(4)]
         for i in range(K - 1):
-            for F in section_faces(shape, d, 0.5 * (L[i] + L[i + 1])):
-                try:
-                    outer, inner = face_loops(F, x, y)
-                except Unsupported as e:
-                    stats["unsupported_sections"] = stats.get("unsupported_sections", 0) + 1
-                    stats.setdefault("unsupported_reasons", set()).add(str(e)[:60])
-                    continue
+            for outer, inner in _slab_sections(shape, d, x, y, L[i], L[i + 1], stats):
                 m_outer = in_loop(outer, uv)
                 m_inner = [in_loop(l, uv) for l in inner]
                 profiles = [("pad", outer, [], m_outer)]
@@ -157,7 +199,7 @@ def extrusion_candidates(shape, faces, ps: PointSet, stats: dict, max_span: int 
                 # combines with a pad along another direction (e.g. side profile × front outline)
                 profiles.append(("trim", rect, [outer], ~m_outer))
                 for op, o, inn, m2 in profiles:
-                    sig = (op, str([c.model_dump() for c in o]), str([[c.model_dump() for c in l] for l in inn]))
+                    sig = (op, _loop_sig(o), tuple(_loop_sig(l) for l in inn))
                     for a in range(max(0, i - max_span + 1), i + 1):
                         for b in range(i + 1, min(K, a + max_span + 1)):
                             key = (tuple(np.round(d, 9)), sig, a, b)
@@ -180,8 +222,24 @@ def extrusion_candidates(shape, faces, ps: PointSet, stats: dict, max_span: int 
                             out.append(Candidate("pad" if op == "pad" else "pocket", mask, feats,
                                                  f"{op} d={np.round(d, 3).tolist()} [{L[a]:.4g},{L[b]:.4g}] {n_curves} curves",
                                                  prefer=-1e-7 * n_curves - (1e-6 if op == "trim" else 0.0),
-                                                 meta={"dir": d, "levels": (L[a], L[b])}))
+                                                 meta={"dir": d, "levels": (L[a], L[b])},
+                                                 contains=_prism_tool(d, x, y, o, inn, lo_, L[b])))
     return out
+
+
+def _prism_tool(d, x, y, outer, inner, lo: float, hi: float) -> Callable:
+    """Membership of the extrusion of (outer minus inner loops) between levels lo and hi along d."""
+    def contains(pts: np.ndarray) -> np.ndarray:
+        h = pts @ d
+        m = (h >= lo) & (h <= hi)
+        if m.any():
+            uv = np.stack([pts[m] @ x, pts[m] @ y], 1)
+            k = in_loop(outer, uv)
+            for loop in inner:
+                k &= ~in_loop(loop, uv)
+            m[m] = k
+        return m
+    return contains
 
 
 # ------------------------------------------------------------------ holes --
@@ -220,9 +278,6 @@ def hole_candidates(shape, faces: list[FaceInfo], ps: PointSet) -> list[Candidat
                 segs.append({"kind": f.kind, "r": f.r_range, "s": f.s_range, "span": f.span,
                              "semi": f.semi_angle})
         segs = sorted([s for s in segs if s["span"] > 2 * math.pi - 1e-3], key=lambda s: s["s"][0])
-        rel = ps.p - loc
-        s_pts = rel @ a + float(loc @ a)
-        r_pts = np.linalg.norm(rel - np.outer(rel @ a, a), axis=1)
         for k, sg in enumerate(segs):
             if sg["kind"] != "cylinder":
                 continue
@@ -231,35 +286,69 @@ def hole_candidates(shape, faces: list[FaceInfo], ps: PointSet) -> list[Candidat
             for sign in (1, -1):
                 entry = s0 if sign == 1 else s1
                 nb = [t for t in segs if t is not sg and abs((t["s"][1] if sign == 1 else t["s"][0]) - entry) < 1e-6 * max(1, diag)]
-                variants = [("simple", entry, None)]
+                variants = [("simple", entry, None, None)]
                 for t in nb:
                     if t["kind"] == "cylinder" and t["r"][0] > r + tol:
-                        variants.append(("counterbore", t["s"][0] if sign == 1 else t["s"][1], t))
+                        variants.append(("counterbore", t["s"][0] if sign == 1 else t["s"][1], t, None))
                     elif t["kind"] == "cone":
                         r_far = t["r"][0] if sign == 1 else t["r"][1]
+                        s_far = t["s"][0] if sign == 1 else t["s"][1]
                         if r_far > r + tol:
-                            variants.append(("countersink", t["s"][0] if sign == 1 else t["s"][1], t))
-                for kind, s_e, t in variants:
+                            variants.append(("countersink", s_far, t, r_far))
+                            # a chamfer on the countersink edge stacks another cone on top: offer the
+                            # countersink cone extended to the end of the cone stack
+                            cur = t
+                            while True:
+                                end = cur["s"][0] if sign == 1 else cur["s"][1]
+                                up = [u for u in segs if u["kind"] == "cone" and u is not cur and
+                                      abs((u["s"][1] if sign == 1 else u["s"][0]) - end) < 1e-6 * max(1, diag)]
+                                if not up:
+                                    break
+                                cur = up[0]
+                            if cur is not t:
+                                s_ext = cur["s"][0] if sign == 1 else cur["s"][1]
+                                variants.append(("countersink", s_ext, t,
+                                                 r_far + abs(s_ext - s_far) * math.tan(t["semi"])))
+                for kind, s_e, t, rc in variants:
                     far = s1 if sign == 1 else s0
                     depth = abs(far - s_e)
                     for through in (False, True):
-                        rel_s = (s_pts - s_e) * sign
-                        m = (r_pts <= r) & (rel_s >= -1e-9) & (through | (rel_s <= depth + 1e-9))
                         h = {"type": "hole", "kind": kind,
                              "position": tuple(float(v) for v in loc + a * (s_e - loc @ a)),
                              "direction": tuple(float(v) for v in a * sign), "diameter": 2 * r}
                         h.update({"through_all": True} if through else {"depth": depth})
+                        head = None
                         if kind == "counterbore":
                             rc, dc = t["r"][0], abs(t["s"][1] - t["s"][0])
-                            m |= (r_pts <= rc) & (rel_s >= -1e-9) & (rel_s <= dc + 1e-9)
                             h.update({"cb_diameter": 2 * rc, "cb_depth": dc})
+                            head = ("cb", rc, dc)
                         elif kind == "countersink":
-                            rc = t["r"][0] if sign == 1 else t["r"][1]
-                            ang = 2 * math.degrees(t["semi"])
-                            cone_r = rc - rel_s * math.tan(t["semi"])
-                            m |= (rel_s >= -1e-9) & (r_pts <= cone_r)
-                            h.update({"cs_diameter": 2 * rc, "cs_angle": ang})
-                        out.append(Candidate("hole", m, [h], f"hole {kind} Ø{2 * r:.4g} "
+                            h.update({"cs_diameter": 2 * rc, "cs_angle": 2 * math.degrees(t["semi"])})
+                            head = ("cs", rc, t["semi"])
+                        tool = _hole_tool(loc, a, sign, s_e, r, None if through else depth, head)
+                        out.append(Candidate("hole", tool(ps.p), [h], f"hole {kind} Ø{2 * r:.4g} "
                                              f"{'through' if through else f'depth {depth:.4g}'} dir {np.round(a * sign, 3).tolist()}",
-                                             prefer=1e-6))
+                                             # equal error → through: leaves the exit edge for a later chamfer / fillet
+                                             prefer=1e-6 + (1e-7 if through else 0.0), contains=tool))
     return out
+
+
+def _hole_tool(loc, a, sign: int, s_e: float, r: float, depth: float | None, head) -> Callable:
+    """Membership of a hole tool: cylinder of radius r from axial position s_e along a·sign
+    (``depth`` None = through), plus a counterbore ("cb", r, depth) or countersink ("cs", r, semi)."""
+    s0 = float(loc @ a)
+
+    def contains(pts: np.ndarray) -> np.ndarray:
+        rel = pts - loc
+        ax = rel @ a
+        rad = np.linalg.norm(rel - np.outer(ax, a), axis=1)
+        rel_s = (ax + s0 - s_e) * sign
+        m = (rad <= r) & (rel_s >= -1e-9)
+        if depth is not None:
+            m &= rel_s <= depth + 1e-9
+        if head and head[0] == "cb":
+            m |= (rad <= head[1]) & (rel_s >= -1e-9) & (rel_s <= head[2] + 1e-9)
+        elif head:
+            m |= (rel_s >= -1e-9) & (rad <= head[1] - rel_s * math.tan(head[2]))
+        return m
+    return contains

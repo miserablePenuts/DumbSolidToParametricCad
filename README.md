@@ -129,6 +129,8 @@ Onshape terms).
 │                     #   the single implementation of UV-grid sampling used by the whole pipeline,
 │                     #   plus optional exact analytic face / edge attributes
 ├── identify.py       # feature identification for a STEP: per-face classes + instances (JSON / PNG / STEP)
+├── recon/            # geometry-first reconstruction (no learning): exact feature candidates from the
+│                     #   STEP B-Rep + search + kernel verification (reconstruct.py, bench.py)
 ├── cadseq/
 │   ├── schema.py     # pydantic models = the JSON format (v1.0)
 │   ├── build.py      # JSON → CadQuery solid → STEP (Builder applies features incrementally)
@@ -736,3 +738,73 @@ falling at epoch 60 — longer training is a cheap later gain.
 .venv\Scripts\python.exe -m cadseq.edgefix data\synth_v2 --workers 8     # once
 .venv\Scripts\python.exe -m s2pnet.train --data data\synth_v2 --out runs\v3 --epochs 60 --bs 24 --attrs --copy --aux-seg 0.2 --edge-ptr --pose-aug 0.75 --loader-workers 4
 ```
+
+## Geometry-first reconstruction (`recon/`, no learning)
+
+On real STEP files the v3 model failed badly (`WeirdPart.stp` IoU 0.41, a 54-face production part
+0.14): the structure it generates is wrong whenever the part leaves the synthetic distribution (tilted
+planes, off-grid dimensions, lengths beyond the token range). `recon/` turns the problem around:
+every feature is **read from the exact B-Rep of the input** and a search only *chooses* among them,
+with the CAD kernel verifying every choice. No training data, no tokens, no grid — values are the
+STEP's own numbers (e.g. 59.8134 mm, not 59.8).
+
+```
+STEP → exact faces (plane / cylinder / cone / torus …), sample points (uniform + ±δ off every face)
+  ├─ pad / pocket / trim candidates: for every extrusion direction (plane normals, cylinder axes —
+  │    tilted ones included) the planes ⊥ d give levels; each slab between levels is sectioned
+  │    (OCC) at several heights and every representable outline (lines / arcs / circles) becomes a
+  │    sketch, extruded over any span of levels. Trim = cut everything outside an outline, which
+  │    intersects prisms of different directions (side profile × front outline).
+  ├─ hole candidates: coaxial concave cylinders / cones → simple / counterbore / countersink,
+  │    blind or through, from either end (countersinks extended through a chamfer on their edge)
+  ├─ beam search: minimise the weighted point error (each face weighs the same as the bulk) +
+  │    a small cost per feature; every candidate has an analytic inside-test, so scoring needs no
+  │    booleans
+  ├─ kernel rebuild (cadseq.build.Builder); rejected features are banned and the search re-planned
+  ├─ blends: unexplained fillet faces (tangent cylinder / torus) and chamfer faces (planar strip,
+  │    cone on a circular edge) → recovered sharp edge (cadseq.blends) + exact radius / distance,
+  │    kept only if they reduce the error
+  └─ mirror: if the part is symmetric, the half part is reconstructed and mirrored; the shorter
+       history of equal quality wins
+→ <out>.json (strictly rebuildable), <out>_rebuilt.step, <out>_report.json,
+  <out>_unexplained.step (input faces the history does not explain, in red — what is left for the designer)
+```
+
+```powershell
+.venv\Scripts\python.exe -m recon.reconstruct part.stp --out runs\recon\part
+.venv\Scripts\python.exe -m recon.bench --data data\synth_v2 --split test --n 200 --workers 12 --timeout 300 --name test200
+.venv\Scripts\python.exe -m recon.bench --steps C:\parts\*.stp --workers 4 --name real
+```
+
+OpenCASCADE sometimes kills the process (access violation) inside fillet / chamfer calls, which no
+`try` can catch. Blend calls are journaled; `recon.reconstruct` runs in a child process and on a crash
+restarts it, skipping the blend group that crashed (`recon.bench` does the same per part).
+Point classification dominated the runtime, so surface samples are labelled by construction (agrees
+with the kernel classifier on 99.97 % of 255K samples) and the rebuilt body is predicted from the
+candidates' analytic inside-tests.
+
+**Results — first 200 parts of the test split** (same parts for every row; failures count as IoU 0):
+
+| method | IoU mean | IoU median | > 0.95 | > 0.99 | > 0.999 | strict rebuild |
+|---|---|---|---|---|---|---|
+| v3 greedy | 0.894 | 0.987 | 76.5 % | 44.0 % | 14.5 % | 31.0 % |
+| v3 + generate-and-verify (8, T = 0.5) | 0.957 | 0.993 | 87.0 % | 57.0 % | 24.0 % | 39.0 % |
+| **recon** | **0.979** | **0.9995** | **92.0 %** | **81.0 %** | **60.5 %** | **99.0 %** |
+
+Median 9.5 s per part (90th percentile 38 s, 12 workers); 1 of 200 timed out (123 faces, > 300 s).
+Histories have a median 0.88× the ground-truth feature count. Weakest family: `stepped_shaft`
+(53 % > 0.99) — turned parts are built from stacked pads, revolve is not in the vocabulary yet.
+17 % of input faces stay unexplained, mostly fillets / chamfers whose sharp edge does not exist in the
+rebuilt body and small cone / torus faces.
+
+Real parts (no history known):
+
+| part | v3 + G&V IoU | recon IoU | features | unexplained faces | time |
+|---|---|---|---|---|---|
+| `examples/SimpleRectangle.stp` | 1.0 (v2) | **1.0**, strict | 1 pad | 0 / 6 | 2 s |
+| `WeirdPart.stp` (13 faces, off-grid) | 0.41 | **1.0**, strict | pad + 2 trims | 0 / 13 | 1 s |
+| `6439884_PIA_WEBBING.stp` (54 faces, 600 mm, tilted bend) | 0.14 | **0.979**, strict | pad + 2 trims | 5 / 54 (top end: 2 small R10 corner rounds, 2 angled end faces, 1 step face) | 12 s |
+
+Next: revolve candidates (turned parts), sharp-edge reconstruction for fillets whose edge is missing
+in the rebuilt body, and a learned candidate scorer trained by self-training on real STEP files
+(search-verified histories as targets).
