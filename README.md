@@ -131,6 +131,8 @@ Onshape terms).
 ├── identify.py       # feature identification for a STEP: per-face classes + instances (JSON / PNG / STEP)
 ├── recon/            # geometry-first reconstruction (no learning): exact feature candidates from the
 │                     #   STEP B-Rep + search + kernel verification (reconstruct.py, bench.py)
+├── features/         # side project: STEP → structured feature JSON (rules + segmenter cross-check),
+│                     #   front end for automated design reviews — see features/README.md
 ├── cadseq/
 │   ├── schema.py     # pydantic models = the JSON format (v1.0)
 │   ├── build.py      # JSON → CadQuery solid → STEP (Builder applies features incrementally)
