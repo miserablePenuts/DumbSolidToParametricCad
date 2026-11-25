@@ -12,6 +12,7 @@ against this JSON, and every finding can point at concrete faces.
 # from solid2param/
 .venv\Scripts\python.exe -m features.extract part.stp                         # → runs\features\part_features.json / .step
 .venv\Scripts\python.exe -m features.extract part.stp --out out\part --no-seg  # rules only, no segmenter
+.venv\Scripts\python.exe -m features.render runs\features\part_features.json   # → runs\features\part_render.png
 .venv\Scripts\python.exe -m features.evaluate --data data\synth_v2 --split test --n 200 --workers 8
 ```
 
@@ -20,6 +21,7 @@ against this JSON, and every finding can point at concrete faces.
 | `extract.py` | CLI + orchestration: recognizers → tie-breaks → ids → JSON / coloured STEP |
 | `recognize.py` | rule-based recognizers (holes, fillets, chamfers, extrusions, patterns, symmetry) |
 | `crosscheck.py` | segmenter second opinion: per-feature agreement, conflicts, hints for unrecognised faces |
+| `render.py` | PNG of the part with faces coloured by feature (no CAD viewer needed); `--views above below side top above_back below_back` |
 | `evaluate.py` | scoring against the known histories of the synthetic dataset |
 
 ## 1. Why rules first, and where the ML model fits
